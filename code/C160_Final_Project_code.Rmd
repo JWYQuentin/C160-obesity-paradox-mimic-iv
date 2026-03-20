@@ -1,0 +1,578 @@
+---
+title: "C160 Final Project"
+author: "Quentin Mei"
+date: "2026-03-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data preparation
+```{r}
+library(data.table)
+library(ggplot2)
+library(comorbidity)
+library(faircause)
+
+DATA_DIR <- "/Users/meizunhong/Downloads/UCLA\ Courses/Stats\ C160/C160\ Final\ Project/C160\ Final\ Dataset"
+
+# Helper: build path flexibly — edit this if your layout differs
+fp <- function(...) file.path(DATA_DIR, ...)
+
+cat("Loading core tables...\n")
+
+patients   <- fread(fp("patients.csv"))
+admissions <- fread(fp("admissions.csv"))
+icustays   <- fread(fp("icustays.csv"))
+
+icustays[, intime  := as.POSIXct(intime)]
+icustays[, outtime := as.POSIXct(outtime)]
+
+#consider first stay of patient
+first_stays <- icustays[order(subject_id, intime)][, .SD[1], by = subject_id]
+cat("  First ICU stays:", nrow(first_stays), "\n")
+```
+
+## Build analysis dataset -- Z variable
+```{r}
+dat <- merge(
+  first_stays[, .(subject_id, hadm_id, stay_id, intime)],
+  patients[, .(subject_id, anchor_age, gender)],
+  by = "subject_id"
+)
+setnames(dat, c("anchor_age", "gender"), c("age", "sex"))
+
+# Add mortality outcome (Y)
+dat <- merge(
+  dat,
+  admissions[, .(hadm_id, hospital_expire_flag)],
+  by = "hadm_id"
+)
+setnames(dat, "hospital_expire_flag", "death")
+
+# Encode sex as numeric (Female = 0, Male = 1) — matching vignette convention
+dat[, sex := as.integer(sex == "M")]
+nrow(dat)
+```
+
+## Get BMI from table and binarize
+```{r}
+omr <- fread(fp("omr.csv"))
+
+# Filter to BMI rows, clean values
+bmi_data <- omr[grepl("BMI", result_name, ignore.case = TRUE)]
+bmi_data[, bmi_value := as.numeric(result_value)]
+bmi_data <- bmi_data[!is.na(bmi_value) & bmi_value >= 10 & bmi_value <= 80]
+bmi_data[, chartdate := as.Date(chartdate)]
+bmi_data <- merge(bmi_data, first_stays[, .(subject_id, intime)], by = "subject_id")
+bmi_data[, days_before := as.numeric(difftime(as.Date(intime), chartdate, units = "days"))]
+
+# Prefer BMI recorded before ICU admission
+bmi_before <- bmi_data[days_before >= 0]
+
+# Take the closest pre-admission BMI per patient
+bmi_per_patient <- bmi_before[order(subject_id, days_before)][
+  , .(bmi = first(bmi_value)), by = subject_id
+]
+
+# Fallback: if too few patients have pre-admission BMI, use most recent BMI
+if (nrow(bmi_per_patient) < 10000) {
+  cat("  Warning: only", nrow(bmi_per_patient), 
+      "patients with pre-admission BMI. Falling back to most recent BMI.\n")
+  bmi_per_patient <- bmi_data[order(subject_id, -chartdate)][
+    , .(bmi = first(bmi_value)), by = subject_id
+  ]
+}
+
+# Inner join: drop patients without BMI (cannot impute treatment variable)
+dat <- merge(dat, bmi_per_patient, by = "subject_id", all.x = FALSE)
+cat("  Patients with valid BMI:", nrow(dat), "\n")
+
+# Binarize: obese (BMI >= 30) vs non-obese (BMI < 30)
+dat[, obese := as.integer(bmi >= 30)]
+cat("  Obese:", sum(dat$obese == 1), "| Non-obese:", sum(dat$obese == 0), "\n")
+
+# Keep bmi for Table 1 descriptive stats; we'll drop it before fairness_cookbook()
+rm(omr, bmi_data, bmi_before, bmi_per_patient)
+gc()
+```
+## Admission Service Type
+```{r}
+services <- fread(fp("services.csv"))
+
+# First service per hospital admission
+first_service <- services[order(hadm_id, transfertime)][, .SD[1], by = hadm_id]
+
+# Categorize into broad groups (matching the vignette's categories)
+first_service[, diag := fcase(
+  curr_service %in% c("MED", "CMED", "OMED", "GU", "GYN", "OBS"), "MED",
+  curr_service %in% c("SURG", "CSURG", "NSURG", "VSURG", "TSURG", 
+                       "ORTHO", "DENT", "ENT", "PSURG"),              "SURG",
+  curr_service %in% c("TRAUM"),                                       "TRAUM",
+  curr_service %in% c("NMED", "NB", "NBB"),                           "NMED",
+  default = "OTHER"
+)]
+
+dat <- merge(dat, first_service[, .(hadm_id, diag)], by = "hadm_id", all.x = TRUE)
+dat[is.na(diag), diag := "OTHER"]
+
+cat("  Diagnosis type distribution:\n")
+print(table(dat$diag))
+
+rm(services, first_service)
+gc()
+```
+
+## Mediator
+```{r}
+diagnoses <- fread(fp("diagnoses_icd.csv.gz"))
+diagnoses <- diagnoses[hadm_id %in% dat$hadm_id]
+
+# Separate by ICD version
+diag_9  <- diagnoses[icd_version == 9,  .(hadm_id, icd_code)]
+diag_10 <- diagnoses[icd_version == 10, .(hadm_id, icd_code)]
+
+charlson_scores <- data.table(hadm_id = integer(), charlson = numeric())
+
+if (nrow(diag_10) > 0) {
+  cci_10 <- comorbidity(
+    x = as.data.frame(diag_10),
+    id = "hadm_id", code = "icd_code",
+    map = "charlson_icd10_quan", assign0 = FALSE
+  )
+  # Score BEFORE converting to data.table (score() needs the comorbidity class)
+  charlson_10 <- score(cci_10, weights = "quan", assign0 = FALSE)
+  cci_10 <- as.data.table(cci_10)
+  cci_10[, charlson := charlson_10]
+  charlson_scores <- rbind(charlson_scores, cci_10[, .(hadm_id, charlson)])
+}
+
+if (nrow(diag_9) > 0) {
+  cci_9 <- comorbidity(
+    x = as.data.frame(diag_9),
+    id = "hadm_id", code = "icd_code",
+    map = "charlson_icd9_quan", assign0 = FALSE
+  )
+  charlson_9 <- score(cci_9, weights = "quan", assign0 = FALSE)
+  cci_9 <- as.data.table(cci_9)
+  cci_9[, charlson := charlson_9]
+  charlson_scores <- rbind(charlson_scores, cci_9[, .(hadm_id, charlson)])
+}
+
+# If a hadm_id appears in both ICD versions, take the max
+charlson_scores <- charlson_scores[, .(charlson = max(charlson)), by = hadm_id]
+
+dat <- merge(dat, charlson_scores, by = "hadm_id", all.x = TRUE)
+dat[is.na(charlson), charlson := 0]
+
+range(dat$charlson)
+
+rm(diagnoses, diag_9, diag_10, charlson_scores)
+gc()
+
+labevents <- fread(
+  fp("labevents.csv"),
+  select = c("subject_id", "hadm_id", "itemid", "charttime", "valuenum")
+)
+cat("  labevents loaded:", nrow(labevents), "rows\n")
+
+# Key lab itemids:
+#   50813 = Lactate
+#   50878 = AST
+#   50821 = PaO2
+#   50816 = FiO2
+lab_items <- c(50813, 50878, 50821, 50816)
+
+labs <- labevents[itemid %in% lab_items]
+labs <- labs[hadm_id %in% dat$hadm_id]
+labs[, charttime := as.POSIXct(charttime)]
+
+rm(labevents)
+gc()
+
+# Filter to first 24 hours of ICU admission
+labs <- merge(labs, dat[, .(hadm_id, stay_id, intime)], by = "hadm_id")
+labs[, hours_since_icu := as.numeric(difftime(charttime, intime, units = "hours"))]
+labs_24 <- labs[hours_since_icu >= 0 & hours_since_icu <= 24 & !is.na(valuenum)]
+
+cat("  Lab values in first 24h:", nrow(labs_24), "\n")
+
+lact_24 <- labs_24[itemid == 50813,
+                   .(lact_24 = max(valuenum, na.rm = TRUE)), by = stay_id]
+
+# --- AST: worst = highest ---
+ast_24 <- labs_24[itemid == 50878,
+                  .(ast_24 = max(valuenum, na.rm = TRUE)), by = stay_id]
+
+# --- PaO2/FiO2 ratio (paired approach) ---
+# Compute ratio per blood gas draw, then take worst (lowest)
+pao2_vals <- labs_24[itemid == 50821, .(stay_id, charttime, pao2 = valuenum)]
+fio2_vals <- labs_24[itemid == 50816, .(stay_id, charttime, fio2 = valuenum)]
+
+# Standardize FiO2: if > 1, treat as percentage
+fio2_vals[fio2 > 1, fio2 := fio2 / 100]
+fio2_vals <- fio2_vals[fio2 > 0]  # avoid division by zero
+
+# Pair by closest timestamp within same stay
+if (nrow(pao2_vals) > 0 & nrow(fio2_vals) > 0) {
+  setkey(pao2_vals, stay_id, charttime)
+  setkey(fio2_vals, stay_id, charttime)
+  paired <- fio2_vals[pao2_vals, on = .(stay_id, charttime), roll = "nearest"]
+  paired[, pafi := pao2 / fio2]
+  pafi_24 <- paired[!is.na(pafi) & is.finite(pafi),
+                    .(pafi_24 = min(pafi, na.rm = TRUE)), by = stay_id]
+} else {
+  pafi_24 <- data.table(stay_id = integer(), pafi_24 = numeric())
+}
+
+# Merge labs into main dataset
+dat <- merge(dat, lact_24,  by = "stay_id", all.x = TRUE)
+dat <- merge(dat, ast_24,   by = "stay_id", all.x = TRUE)
+dat <- merge(dat, pafi_24,  by = "stay_id", all.x = TRUE)
+
+cat("  Lab coverage — lact:", sum(!is.na(dat$lact_24)),
+    "| ast:", sum(!is.na(dat$ast_24)),
+    "| pafi:", sum(!is.na(dat$pafi_24)), "\n")
+
+rm(labs, labs_24, lact_24, ast_24, pao2_vals, fio2_vals, pafi_24)
+if (exists("paired")) rm(paired)
+gc()
+
+```
+## Impute Missing Values
+```{r}
+imp_lst <- list(
+  charlson = 0,
+  lact_24  = 1,       # normal lactate ~ 1 mmol/L
+  ast_24   = 20,      # normal AST ~ 20 U/L
+  pafi_24  = 500,     # normal PaO2/FiO2 ~ 500
+  death    = FALSE
+)
+
+for (i in seq_len(ncol(dat))) {
+  var <- names(dat)[i]
+  if (any(is.na(dat[[var]])) & !is.null(imp_lst[[var]]))
+    dat[is.na(get(var)), c(var) := imp_lst[[var]]]
+}
+
+# Ensure death is numeric
+dat[, death := as.integer(death)]
+```
+
+## Descriptive Table
+```{r}
+cat("\n===== TABLE 1: COHORT CHARACTERISTICS =====\n")
+cat("Total patients:", nrow(dat), "\n\n")
+
+# Summary by obesity status
+for (grp in c(0, 1)) {
+  sub <- dat[obese == grp]
+  label <- ifelse(grp == 1, "Obese (BMI >= 30)", "Non-obese (BMI < 30)")
+  cat(label, " (n =", nrow(sub), ")\n")
+  cat("  Age:      mean =", round(mean(sub$age), 1),
+      ", sd =", round(sd(sub$age), 1), "\n")
+  cat("  Male:    ", round(mean(sub$sex) * 100, 1), "%\n")
+  cat("  BMI:      mean =", round(mean(sub$bmi), 1),
+      ", sd =", round(sd(sub$bmi), 1), "\n")
+  cat("  Mortality:", round(mean(sub$death) * 100, 2), "%\n")
+  cat("  Charlson:  mean =", round(mean(sub$charlson), 1), "\n")
+  cat("  Lactate:   mean =", round(mean(sub$lact_24), 2), "\n")
+  cat("  PaFi:      mean =", round(mean(sub$pafi_24), 1), "\n")
+  cat("  AST:       mean =", round(mean(sub$ast_24), 1), "\n")
+  cat("  Diag distribution:\n")
+  print(round(prop.table(table(sub$diag)) * 100, 1))
+  cat("\n")
+}
+```
+
+## Prepare Data for Faircause
+```{r}
+dat[, c("subject_id", "hadm_id", "stay_id", "intime", "bmi") := NULL]
+
+# Handle the diag factor: dummy-code it for fairness_cookbook()
+# (Random forest internals handle numeric/binary better than multi-level factors)
+diag_levels <- unique(dat$diag)
+# Create binary indicators, drop one reference category (OTHER)
+for (dx in setdiff(diag_levels, "OTHER")) {
+  dat[, paste0("diag_", dx) := as.integer(diag == dx)]
+}
+dat[, diag_orig := diag]  # keep original for heterogeneity stratification
+dat[, diag := NULL]
+cat("Final variables:", paste(names(dat), collapse = ", "), "\n")
+cat("Final cohort size:", nrow(dat), "\n\n")
+```
+
+## Define Causal Model
+```{r}
+X <- "obese"
+Z <- c("age", "sex")
+Y <- "death"
+
+# Mediators: dummy-coded diag + continuous clinical variables
+W_diag <- grep("^diag_(?!orig)", names(dat), value = TRUE, perl = TRUE)
+W <- c(W_diag, "charlson", "lact_24", "pafi_24", "ast_24")
+
+cat("Treatment (X):", X, "\n")
+cat("Confounders (Z):", paste(Z, collapse = ", "), "\n")
+cat("Mediators (W):", paste(W, collapse = ", "), "\n")
+cat("Outcome (Y):", Y, "\n\n")
+```
+
+### TV decomposition
+```{r}
+model_cols <- c(X, Z, W, Y)
+dat_model <- as.data.frame(dat[, ..model_cols])
+
+fcb <- fairness_cookbook(
+  data = dat_model,
+  X = X, Z = Z, W = W, Y = Y,
+  x0 = 0, x1 = 1
+)
+p_main <- autoplot(fcb) +
+  labs(
+    title = "Causal Decomposition of Mortality Difference: Obesity Paradox (MIMIC-IV)",
+    y = "Mortality difference"
+  ) +
+  theme_minimal(base_size = 14) +
+  scale_x_discrete(
+    labels = c("Total Variation", "Direct", "Indirect", "Confounded"),
+    name = "Pathway"
+  ) +
+  scale_fill_discrete(
+    labels = c("Total Variation", "Direct", "Indirect", "Confounded"),
+    name = "Pathway"
+  )
+
+print(p_main)
+ggsave("main_decomposition.pdf", p_main, width = 10, height = 6)
+summary(fcb)
+names(dat)
+```
+
+## Heterogeneity Analysis by age group
+```{r}
+dat[, age_group := cut(age,
+                       breaks = c(17, 49, 64, 74, 100),
+                       labels = c("18-49", "50-64", "65-74", "74+"))]
+
+het_age <- list()
+het_age_summary <- data.table()
+
+for (ag in levels(dat$age_group)) {
+  sub <- dat[age_group == ag]
+  n_obese <- sum(sub$obese == 1)
+  n_non   <- sum(sub$obese == 0)
+  
+  cat("  Age group", ag, ": n_obese =", n_obese, ", n_non_obese =", n_non, "\n")
+  
+  if (n_obese > 50 & n_non > 50) {
+    sub_model <- as.data.frame(sub[, ..model_cols])
+    het_age[[ag]] <- fairness_cookbook(
+      data = sub_model,
+      X = X, Z = Z, W = W, Y = Y,
+      x0 = 0, x1 = 1
+    )
+    
+    s_dt <- as.data.table(het_age[[ag]]$measures)
+    s_dt[, age_group := ag]
+    het_age_summary <- rbind(het_age_summary, s_dt, fill = TRUE)
+  } else {
+    cat("    -> Skipped (insufficient sample size)\n")
+  }
+}
+
+for (ag in names(het_age)) {
+  p <- autoplot(het_age[[ag]]) +
+    labs(
+      title = paste("Decomposition — Age Group:", ag),
+      y = "Mortality difference"
+    ) +
+    theme_minimal(base_size = 14)
+  print(p)
+  ggsave(paste0("decomp_age_", gsub("-", "_", ag), ".pdf"), p, width = 10, height = 6)
+}
+str(fcb)
+```
+
+## By diagnose type
+```{r}
+het_diag <- list()
+het_diag_summary <- data.table()
+
+# When stratifying by diag, remove diag dummies from W
+W_no_diag <- setdiff(W, W_diag)
+
+for (dx in unique(as.character(dat$diag_orig))) {
+  sub <- dat[diag_orig == dx]
+  n_obese <- sum(sub$obese == 1)
+  n_non   <- sum(sub$obese == 0)
+  
+  cat("  Diagnosis:", dx, ": n_obese =", n_obese, ", n_non_obese =", n_non, "\n")
+  
+  if (n_obese > 50 & n_non > 50) {
+    model_cols_sub <- c(X, Z, W_no_diag, Y)
+    sub_model <- as.data.frame(sub[, ..model_cols_sub])
+    
+    het_diag[[dx]] <- fairness_cookbook(
+      data = sub_model,
+      X = X, Z = Z, W = W_no_diag, Y = Y,
+      x0 = 0, x1 = 1
+    )
+    
+    s_dt <- as.data.table(het_diag[[dx]]$measures)
+    s_dt[, diagnosis := dx]
+    het_diag_summary <- rbind(het_diag_summary, s_dt, fill = TRUE)
+  } else {
+    cat("    -> Skipped (insufficient sample size)\n")
+  }
+}
+
+# Individual plots per diagnosis type
+for (dx in names(het_diag)) {
+  p <- autoplot(het_diag[[dx]]) +
+    labs(
+      title = paste("Decomposition — Diagnosis:", dx),
+      y = "Mortality difference"
+    ) +
+    theme_minimal(base_size = 14)
+  print(p)
+  ggsave(paste0("decomp_diag_", tolower(dx), ".pdf"), p, width = 10, height = 6)
+}
+```
+
+## Combined Heatmap
+```{r}
+# ============================================================
+# PART 18: COMBINED HEATMAP (Lecture 14 style, slides 23/26)
+# ============================================================
+
+cat("\nBuilding cross-stratified heatmap (age × diagnosis)...\n")
+
+cross_results <- data.table()
+
+for (ag in levels(dat$age_group)) {
+  for (dx in c("MED", "SURG")) {  # focus on the two largest groups
+    sub <- dat[age_group == ag & diag_orig == dx]
+    n_obese <- sum(sub$obese == 1)
+    n_non   <- sum(sub$obese == 0)
+    
+    cat("  Age:", ag, "| Diag:", dx, 
+        "| n_obese:", n_obese, "| n_non:", n_non, "\n")
+    
+    if (n_obese > 30 & n_non > 30) {
+      model_cols_sub <- c(X, Z, W_no_diag, Y)
+      sub_model <- as.data.frame(sub[, ..model_cols_sub])
+      
+      fcb_sub <- tryCatch({
+        fairness_cookbook(
+          data = sub_model,
+          X = X, Z = Z, W = W_no_diag, Y = Y,
+          x0 = 0, x1 = 1
+        )
+      }, error = function(e) {
+        cat("    -> Error:", conditionMessage(e), "\n")
+        return(NULL)
+      })
+      
+      if (!is.null(fcb_sub)) {
+        s_dt <- as.data.table(fcb_sub$measures)
+        s_dt[, `:=`(age_group = ag, diagnosis = dx)]
+        cross_results <- rbind(cross_results, s_dt, fill = TRUE)
+      }
+    } else {
+      cat("    -> Skipped (insufficient sample)\n")
+    }
+  }
+}
+
+# Build heatmap if we have results
+if (nrow(cross_results) > 0) {
+  # Extract direct effect rows (ctfde = counterfactual direct effect)
+  de_results <- cross_results[measure == "ctfde"]
+  
+  if (nrow(de_results) > 0) {
+    # Add confidence interval labels
+    de_results[, ci_low  := value - 1.96 * sd]
+    de_results[, ci_high := value + 1.96 * sd]
+    de_results[, label := paste0(
+      round(value * 100, 1), "%\n[",
+      round(ci_low * 100, 1), "%, ",
+      round(ci_high * 100, 1), "%]"
+    )]
+    
+    p_heat <- ggplot(de_results, aes(x = diagnosis, y = age_group, fill = value)) +
+      geom_tile(color = "white", linewidth = 1) +
+      geom_text(aes(label = label), size = 3.5, fontface = "bold") +
+      scale_fill_gradient2(
+        low = "#4575B4", mid = "white", high = "#D73027", 
+        midpoint = 0,
+        name = "Direct\nEffect",
+        labels = scales::percent
+      ) +
+      labs(
+        title = "Heterogeneous Direct Effect (Age / Admission Type)",
+        subtitle = "Obesity Paradox — MIMIC-IV",
+        x = "Diagnosis Group",
+        y = "Age Group (years)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(panel.grid = element_blank())
+    
+    print(p_heat)
+    ggsave("heatmap_direct_effect.pdf", p_heat, width = 8, height = 6)
+  }
+  
+  # Also build indirect effect heatmap
+  ie_results <- cross_results[measure == "ctfie"]
+  
+  if (nrow(ie_results) > 0) {
+    ie_results[, ci_low  := value - 1.96 * sd]
+    ie_results[, ci_high := value + 1.96 * sd]
+    ie_results[, label := paste0(
+      round(value * 100, 1), "%\n[",
+      round(ci_low * 100, 1), "%, ",
+      round(ci_high * 100, 1), "%]"
+    )]
+    
+    p_heat_ie <- ggplot(ie_results, aes(x = diagnosis, y = age_group, fill = value)) +
+      geom_tile(color = "white", linewidth = 1) +
+      geom_text(aes(label = label), size = 3.5, fontface = "bold") +
+      scale_fill_gradient2(
+        low = "#4575B4", mid = "white", high = "#D73027", 
+        midpoint = 0,
+        name = "Indirect\nEffect",
+        labels = scales::percent
+      ) +
+      labs(
+        title = "Heterogeneous Indirect Effect (Age / Admission Type)",
+        subtitle = "Obesity Paradox — MIMIC-IV",
+        x = "Diagnosis Group",
+        y = "Age Group (years)"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(panel.grid = element_blank())
+    
+    print(p_heat_ie)
+    ggsave("heatmap_indirect_effect.pdf", p_heat_ie, width = 8, height = 6)
+  }
+  
+  # Print all cross-stratified results as a summary table
+  cat("\n===== CROSS-STRATIFIED RESULTS =====\n")
+  for (ag in unique(cross_results$age_group)) {
+    for (dx in unique(cross_results$diagnosis)) {
+      sub_res <- cross_results[age_group == ag & diagnosis == dx]
+      if (nrow(sub_res) > 0) {
+        cat(sprintf("\n  Age: %s | Diag: %s\n", ag, dx))
+        for (i in 1:nrow(sub_res)) {
+          cat(sprintf("    %-8s: %+.4f  (sd = %.4f)\n",
+                      sub_res$measure[i], sub_res$value[i], sub_res$sd[i]))
+        }
+      }
+    }
+  }
+
+}
+```
+
